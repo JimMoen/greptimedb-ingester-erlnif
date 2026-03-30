@@ -183,7 +183,11 @@ pub fn terms_to_schema_and_rows<'a>(
         .or_else(|| first_row.map_get(atom_ts).ok());
 
     if ts_term.is_some() {
-        let ts_name = if ts_column.is_empty() { "ts" } else { ts_column };
+        let ts_name = if ts_column.is_empty() {
+            "ts"
+        } else {
+            ts_column
+        };
         schema.push(timestamp(ts_name, ColumnDataType::TimestampMillisecond));
     }
 
