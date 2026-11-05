@@ -187,7 +187,8 @@ Integer timestamp precision for auto-created tables can be selected with
 `insert/4` (or `insert_async/5`):
 
 ```erlang
-{ok, AffectedRows} = greptimedb_rs:insert(Client, Table, Rows, us).
+RowsUs = [Row#{timestamp => os:system_time(microsecond)}],
+{ok, AffectedRows} = greptimedb_rs:insert(Client, Table, RowsUs, us).
 ```
 
 Supported units are `s`, `ms`, `us`, and `ns`. `insert/3` and
@@ -208,7 +209,8 @@ end, [make_ref()]},
 {ok, ConnPid} = greptimedb_rs:insert_async(Client, Table, Rows, Callback).
 
 % Select the timestamp unit used when auto-creating the table:
-{ok, ConnPid} = greptimedb_rs:insert_async(Client, Table, Rows, us, Callback).
+RowsUs = [Row#{timestamp => os:system_time(microsecond)}],
+{ok, ConnPid} = greptimedb_rs:insert_async(Client, Table, RowsUs, us, Callback).
 ```
 
 ### 5. Schema-less Insertion & Safety
