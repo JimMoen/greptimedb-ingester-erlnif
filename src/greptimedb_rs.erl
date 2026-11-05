@@ -27,7 +27,9 @@
 %% Write - Batch Write, onshot streaming write
 -export([
     insert/3,
-    insert_async/4
+    insert/4,
+    insert_async/4,
+    insert_async/5
 ]).
 
 %% Write - Execute Query
@@ -48,6 +50,7 @@
     client/0,
     opts/0,
     stream_client/0,
+    time_unit/0,
     sql/0,
     result/0,
     reason/0,
@@ -88,6 +91,7 @@
     conn_opts := opts()
 }.
 -type stream_client() :: {stream_client, client(), table()}.
+-type time_unit() :: s | ms | us | ns.
 -type table() :: binary().
 -type sql() :: binary().
 -type result() :: term().
@@ -146,16 +150,33 @@ stop_client(PoolName) ->
 %% Write - Batch Write
 %% ===================================================================
 
-%% @doc Batch write data (blocking).
-%% Picks a connection from the pool to do the write operation.
+%% @doc Batch write data with millisecond timestamps (blocking).
+%%
+%% New callers that need an explicit timestamp unit should use `insert/4'.
 -spec insert(client(), binary(), [map()]) -> {ok, integer()} | {error, reason()}.
 insert(Client, Table, Rows) ->
     call_sync(Client, ?CMD_INSERT, [Table, Rows]).
 
-%% @doc Batch write data (asynchronous).
+%% @doc Batch write data (blocking).
+%%
+%% `Precision' describes the unit of integer timestamps in `Rows'. It is used
+%% when the target table is auto-created; existing tables keep their schema.
+-spec insert(client(), binary(), [map()], time_unit()) ->
+    {ok, integer()} | {error, reason()}.
+insert(Client, Table, Rows, Precision) ->
+    call_sync(Client, ?CMD_INSERT, [Table, Rows, Precision]).
+
+%% @doc Batch write data with millisecond timestamps (asynchronous).
+%%
+%% New callers that need an explicit timestamp unit should use `insert_async/5'.
 -spec insert_async(client(), binary(), [map()], callback()) -> {ok, pid()}.
 insert_async(Client, Table, Rows, ResultCallback) ->
     call_async(Client, ?CMD_INSERT, [Table, Rows], ResultCallback).
+
+%% @doc Batch write data (asynchronous).
+-spec insert_async(client(), binary(), [map()], time_unit(), callback()) -> {ok, pid()}.
+insert_async(Client, Table, Rows, Precision, ResultCallback) ->
+    call_async(Client, ?CMD_INSERT, [Table, Rows, Precision], ResultCallback).
 
 %% ===================================================================
 %% Write - Execute Query

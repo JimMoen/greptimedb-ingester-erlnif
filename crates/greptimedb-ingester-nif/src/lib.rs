@@ -402,7 +402,7 @@ impl Input {
 
 enum Request {
     Execute(String),
-    Insert(String, Input),
+    Insert(String, Input, ColumnDataType),
     StreamStart(String),
     StreamWrite(ResourceArc<StreamWriterResource>, Input),
     StreamClose(ResourceArc<StreamWriterResource>),
@@ -414,9 +414,16 @@ impl Request {
         let args: Vec<Term> = args.decode()?;
         match (command, args.as_slice()) {
             (c, [sql]) if c == atoms::execute() => Ok(Self::Execute(sql.decode()?)),
-            (c, [table, rows]) if c == atoms::insert() => {
-                Ok(Self::Insert(table.decode()?, Input::new(*rows, small)))
-            }
+            (c, [table, rows]) if c == atoms::insert() => Ok(Self::Insert(
+                table.decode()?,
+                Input::new(*rows, small),
+                ColumnDataType::TimestampMillisecond,
+            )),
+            (c, [table, rows, precision]) if c == atoms::insert() => Ok(Self::Insert(
+                table.decode()?,
+                Input::new(*rows, small),
+                timestamp_data_type(*precision)?,
+            )),
             (c, [table, _]) if c == atoms::stream_start() => Ok(Self::StreamStart(table.decode()?)),
             (c, [writer, rows]) if c == atoms::stream_write() => Ok(Self::StreamWrite(
                 writer.decode()?,
@@ -435,6 +442,21 @@ impl Request {
             Self::StreamWrite(writer, _) | Self::StreamClose(writer) => Some(writer.clone()),
             _ => None,
         }
+    }
+}
+
+fn timestamp_data_type(term: Term) -> NifResult<ColumnDataType> {
+    let precision = term.decode::<Atom>()?;
+    if precision == atoms::s() {
+        Ok(ColumnDataType::TimestampSecond)
+    } else if precision == atoms::ms() {
+        Ok(ColumnDataType::TimestampMillisecond)
+    } else if precision == atoms::us() {
+        Ok(ColumnDataType::TimestampMicrosecond)
+    } else if precision == atoms::ns() {
+        Ok(ColumnDataType::TimestampNanosecond)
+    } else {
+        Err(rustler::Error::BadArg)
     }
 }
 
@@ -563,7 +585,12 @@ fn bounded_arguments<'a>(arguments: Term<'a>, binaries: &mut Vec<Term<'a>>) -> b
         return false;
     };
     if !tail.is_empty_list() {
-        return false;
+        let Ok((precision, after_precision)) = tail.list_get_cell() else {
+            return false;
+        };
+        if precision.get_type() != rustler::TermType::Atom || !after_precision.is_empty_list() {
+            return false;
+        }
     }
     let mut cursor = rows;
     for _ in 0..128 {
@@ -713,7 +740,7 @@ fn submit_impl<'a>(
         stopping: runtime.stopping(),
     };
     let started = match request {
-        request @ (Request::Execute(_) | Request::Insert(_, _)) => {
+        request @ (Request::Execute(_) | Request::Insert(_, _, _)) => {
             let future = perform_statement(client, request, deadline, control);
             runtime.spawn(work.run(future, false, |result, _, late| {
                 if let Some(error) = late {
@@ -936,7 +963,7 @@ async fn perform_statement(
             }
             Ok(Value::Batches(batches))
         }
-        Request::Insert(table, input) => {
+        Request::Insert(table, input, timestamp_type) => {
             if input.is_empty() {
                 return Ok(Value::Count(0));
             }
@@ -982,6 +1009,7 @@ async fn perform_statement(
                             Err(_) => util::terms_to_schema_and_rows(
                                 rows,
                                 ts_column.as_deref().unwrap_or("ts"),
+                                timestamp_type,
                             ),
                         })
                     })

@@ -39,4 +39,10 @@ rustler::atoms! {
     tags,
     timestamp,
     ts,
+
+    // Timestamp precision
+    s,
+    ms,
+    us,
+    ns,
 }
