@@ -252,6 +252,7 @@ fn is_null(term: Term) -> bool {
 pub fn terms_to_schema_and_rows<'a>(
     rows_term: Vec<Term<'a>>,
     ts_column: &str,
+    timestamp_type: ColumnDataType,
 ) -> rustler::NifResult<(Vec<ColumnSchema>, Vec<ProtoRow>)> {
     if rows_term.is_empty() {
         return Ok((vec![], vec![]));
@@ -279,7 +280,7 @@ pub fn terms_to_schema_and_rows<'a>(
         } else {
             ts_column
         };
-        schema.push(timestamp(ts_name, ColumnDataType::TimestampMillisecond));
+        schema.push(timestamp(ts_name, timestamp_type));
     }
 
     let schema = merge_inferred_columns(schema, &rows_term)?;

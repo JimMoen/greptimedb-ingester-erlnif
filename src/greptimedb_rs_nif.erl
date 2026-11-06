@@ -33,6 +33,10 @@
     cached_fips_status/0
 ]).
 
+-ifdef(TEST).
+-export([bounded_submission/1]).
+-endif.
+
 -export([init/0]).
 -on_load(init/0).
 

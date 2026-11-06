@@ -14,6 +14,7 @@ all() ->
         {group, tcp},
         {group, tls},
         {group, tls_ciphers},
+        t_bounded_submission_precision,
         t_connect_with_auth
     ].
 
@@ -22,6 +23,10 @@ groups() ->
         t_connect,
         t_metadata_queries,
         t_insert_sync,
+        t_insert_sync_auto_create_timestamp_s,
+        t_insert_sync_auto_create_timestamp_us,
+        t_insert_sync_auto_create_timestamp_ns,
+        t_insert_async_auto_create_timestamp_us,
         t_insert_sync_custom_ts_column,
         t_insert_sync_ttl_hint,
         t_insert_sync_existing_table,
@@ -339,6 +344,18 @@ t_connect_with_auth(_Config) ->
     ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
     ok = greptimedb_rs:stop_client(Client).
 
+t_bounded_submission_precision(_Config) ->
+    Table = <<"mqtt">>,
+    Rows = [#{fields => #{<<"value">> => 1}, timestamp => 1}],
+
+    %% Both the legacy two-argument shape and insert/4's trailing precision
+    %% atom must stay on the bounded small-insert path.
+    ?assertNotEqual(false, greptimedb_rs_nif:bounded_submission([Table, Rows])),
+    ?assertNotEqual(false, greptimedb_rs_nif:bounded_submission([Table, Rows, us])),
+    ?assertEqual(false, greptimedb_rs_nif:bounded_submission([Table, Rows, <<"us">>])),
+    ?assertEqual(false, greptimedb_rs_nif:bounded_submission([Table, Rows, us, extra])),
+    ok.
+
 t_insert_sync(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
@@ -370,6 +387,43 @@ t_insert_sync(Config) ->
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
     {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
     ?assertEqual(1, Count),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_auto_create_timestamp_s(Config) ->
+    assert_auto_create_timestamp(Config, s, second, <<"TimestampSecond">>).
+
+t_insert_sync_auto_create_timestamp_us(Config) ->
+    assert_auto_create_timestamp(Config, us, microsecond, <<"TimestampMicrosecond">>).
+
+t_insert_sync_auto_create_timestamp_ns(Config) ->
+    assert_auto_create_timestamp(Config, ns, nanosecond, <<"TimestampNanosecond">>).
+
+t_insert_async_auto_create_timestamp_us(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = drop_table_if_exists(Client, Table),
+
+    TsUs = erlang:system_time(microsecond),
+    Rows = [#{fields => #{<<"value">> => 1}, timestamp => TsUs}],
+    Callback = {
+        fun(Ref, Result) ->
+            Ref ! {insert_result, Result}
+        end,
+        [self()]
+    },
+    ?assertMatch({ok, _}, greptimedb_rs:insert_async(Client, Table, Rows, us, Callback)),
+
+    receive
+        {insert_result, {ok, _}} -> ok
+    after 10000 ->
+        ct:fail(async_insert_timeout)
+    end,
+    ?assertEqual(
+        {<<"TimestampMicrosecond">>, <<"TIMESTAMP">>},
+        describe_column(Client, Table, <<"ts">>)
+    ),
+    ?assertEqual([TsUs], select_column(Client, Table, <<"ts">>)),
 
     ok = greptimedb_rs:stop_client(Client).
 
@@ -1288,6 +1342,30 @@ create_existing_table(Client, Table) ->
         {ok, _} -> ok;
         Error -> ct:fail({create_table_failed, Table, Error})
     end.
+
+drop_table_if_exists(Client, Table) ->
+    DropSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    case greptimedb_rs:query(Client, DropSql) of
+        {ok, _} -> ok;
+        Error -> ct:fail({drop_table_failed, Table, Error})
+    end.
+
+assert_auto_create_timestamp(Config, Precision, NativeUnit, ExpectedType) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = drop_table_if_exists(Client, Table),
+
+    Timestamp = erlang:system_time(NativeUnit),
+    Rows = [#{fields => #{<<"value">> => 1}, timestamp => Timestamp}],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows, Precision)),
+
+    ?assertEqual(
+        {ExpectedType, <<"TIMESTAMP">>},
+        describe_column(Client, Table, <<"ts">>)
+    ),
+    ?assertEqual([Timestamp], select_column(Client, Table, <<"ts">>)),
+
+    ok = greptimedb_rs:stop_client(Client).
 
 assert_column(Client, Table, Column, Type, SemanticType) ->
     case describe_column(Client, Table, Column) of

@@ -183,6 +183,18 @@ Rows = [Row], % Insert a list of rows
 {ok, AffectedRows} = greptimedb_rs:insert(Client, Table, Rows).
 ```
 
+Integer timestamp precision for auto-created tables can be selected with
+`insert/4` (or `insert_async/5`):
+
+```erlang
+RowsUs = [Row#{timestamp => os:system_time(microsecond)}],
+{ok, AffectedRows} = greptimedb_rs:insert(Client, Table, RowsUs, us).
+```
+
+Supported units are `s`, `ms`, `us`, and `ns`. `insert/3` and
+`insert_async/4` retain the millisecond default. For existing tables, the
+server schema determines the timestamp type.
+
 #### Asynchronous Insert
 Returns immediately with the connection pid. The provided callback is executed upon completion.
 
@@ -195,6 +207,10 @@ end, [make_ref()]},
 
 % Returns {ok, ConnPid} where ConnPid is the connection process handling the request
 {ok, ConnPid} = greptimedb_rs:insert_async(Client, Table, Rows, Callback).
+
+% Select the timestamp unit used when auto-creating the table:
+RowsUs = [Row#{timestamp => os:system_time(microsecond)}],
+{ok, ConnPid} = greptimedb_rs:insert_async(Client, Table, RowsUs, us, Callback).
 ```
 
 ### 5. Schema-less Insertion & Safety
