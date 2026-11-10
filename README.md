@@ -218,9 +218,11 @@ or may not have been applied. Retrying it is at-least-once and can duplicate or
 overwrite rows depending on the target table's merge mode.
 
 Errors that occur before a write is submitted, such as a metadata query
-failure, use `write_outcome => not_sent`. Client-side NIF errors may continue to
-use their existing `nif_error`, timeout, cancellation, or string
-representations.
+failure, row validation, or schema conversion, use
+`write_outcome => not_sent`. Query errors use
+`write_outcome => unknown` because `query/2` can execute mutating SQL such as
+`CREATE TABLE` or `DROP TABLE`. Client-side NIF errors may continue to use their
+existing `nif_error`, timeout, cancellation, or string representations.
 
 #### Asynchronous Insert
 Returns immediately with the connection pid after the request is submitted.

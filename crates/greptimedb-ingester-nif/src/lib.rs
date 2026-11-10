@@ -67,7 +67,10 @@ impl Resource for GreptimeResource {
 
 impl GreptimeResource {
     fn invalidate_channels_on(&self, error: &greptimedb_ingester::Error) {
-        if error_kind(error) == ErrorKind::Transport {
+        if matches!(
+            error_kind(error),
+            ErrorKind::Transport | ErrorKind::Cancelled
+        ) {
             self.channel_manager.retain_channel(|_, _| false);
         }
     }
@@ -326,14 +329,28 @@ fn drain(resource: ResourceArc<GreptimeResource>) -> Atom {
     atoms::ok()
 }
 
-async fn fetch_table_schema(
+enum TableSchemaLookup {
+    Found(TableSchema),
+    NotFound,
+    UnsupportedColumnType(String),
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn describe_table_sql(table_name: &str) -> String {
+    format!("DESCRIBE {}", quote_sql_identifier(table_name))
+}
+
+async fn describe_table(
     client: &GreptimeResource,
     table_name: &str,
-) -> Result<Option<TableSchema>, Failure> {
-    let sql = format!("DESCRIBE {table_name}");
+) -> Result<TableSchemaLookup, Failure> {
+    let sql = describe_table_sql(table_name);
     let mut stream = match client.db.query(&sql).await {
         Ok(stream) => stream,
-        Err(error) if is_table_not_found_error(&error) => return Ok(None),
+        Err(error) if is_table_not_found_error(&error) => return Ok(TableSchemaLookup::NotFound),
         Err(error) => {
             client.invalidate_channels_on(&error);
             return Err(Failure::native(
@@ -353,7 +370,9 @@ async fn fetch_table_schema(
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
         let batch = match batch_res {
             Ok(batch) => batch,
-            Err(error) if is_table_not_found_error(&error) => return Ok(None),
+            Err(error) if is_table_not_found_error(&error) => {
+                return Ok(TableSchemaLookup::NotFound)
+            }
             Err(error) => {
                 client.invalidate_channels_on(&error);
                 return Err(Failure::native(
@@ -414,7 +433,11 @@ async fn fetch_table_schema(
                 "TimestampMillisecond" => ColumnDataType::TimestampMillisecond,
                 "TimestampMicrosecond" => ColumnDataType::TimestampMicrosecond,
                 "TimestampNanosecond" => ColumnDataType::TimestampNanosecond,
-                _ => return Err(Failure::message(format!("Unknown column type: {type_str}"))),
+                _ => {
+                    return Ok(TableSchemaLookup::UnsupportedColumnType(
+                        type_str.to_string(),
+                    ))
+                }
             };
 
             match semantic_str {
@@ -426,7 +449,11 @@ async fn fetch_table_schema(
         }
     }
 
-    Ok(seen_columns.then_some(table_schema))
+    if seen_columns {
+        Ok(TableSchemaLookup::Found(table_schema))
+    } else {
+        Ok(TableSchemaLookup::NotFound)
+    }
 }
 
 struct Input {
@@ -879,14 +906,13 @@ fn error_kind(error: &greptimedb_ingester::Error) -> ErrorKind {
         Error::InvalidTlsConfig { .. } | Error::InvalidConfigFilePath { .. } => {
             ErrorKind::Configuration
         }
-        Error::IllegalDatabaseResponse { .. } | Error::UnexpectedFlightMessage { .. } => {
-            ErrorKind::Protocol
-        }
+        Error::IllegalDatabaseResponse { .. }
+        | Error::SerdeJson { .. }
+        | Error::UnexpectedFlightMessage { .. } => ErrorKind::Protocol,
         Error::IllegalGrpcClientState { .. }
         | Error::MissingField { .. }
         | Error::SerializeMetadata { .. } => ErrorKind::Internal,
         Error::InvalidTonicMetadataValue { .. }
-        | Error::SerdeJson { .. }
         | Error::CreateRecordBatch { .. }
         | Error::UnsupportedDataType { .. }
         | Error::SchemaMismatch { .. }
@@ -899,13 +925,55 @@ fn error_kind(error: &greptimedb_ingester::Error) -> ErrorKind {
 }
 
 fn is_transport_status(status: &tonic::Status) -> bool {
-    match status.code() {
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => true,
-        tonic::Code::Unknown => status
-            .message()
-            .to_ascii_lowercase()
-            .contains("transport error"),
-        _ => false,
+    is_transport_message(status.message())
+        || matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+        )
+}
+
+fn is_transport_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "transport error",
+        "h2 protocol error",
+        "connection error",
+        "error reading a body from connection",
+        "connection reset by peer",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn write_outcome_for_sdk_error(error: &greptimedb_ingester::Error) -> WriteOutcome {
+    use greptimedb_ingester::Error;
+    match error {
+        Error::InvalidTlsConfig { .. }
+        | Error::InvalidConfigFilePath { .. }
+        | Error::CreateChannel { .. }
+        | Error::IllegalGrpcClientState { .. }
+        | Error::MissingField { .. }
+        | Error::InvalidTonicMetadataValue { .. }
+        | Error::CreateRecordBatch { .. }
+        | Error::UnsupportedDataType { .. }
+        | Error::SerializeMetadata { .. }
+        | Error::SchemaMismatch { .. }
+        | Error::InvalidColumnCount { .. }
+        | Error::InvalidColumnIndex { .. }
+        | Error::EmptyRows { .. }
+        | Error::AddRowToBuiltBatch { .. }
+        | Error::UnflushedRows { .. } => WriteOutcome::NotSent,
+        Error::Server { .. }
+        | Error::IllegalDatabaseResponse { .. }
+        | Error::SerdeJson { .. }
+        | Error::SendData { .. }
+        | Error::StreamEnded { .. }
+        | Error::StreamEndedWithPendingRequests { .. }
+        | Error::RequestTimeout { .. }
+        | Error::UnexpectedFlightMessage { .. } => WriteOutcome::Unknown,
     }
 }
 
@@ -982,7 +1050,15 @@ fn is_table_not_found_error(error: &greptimedb_ingester::Error) -> bool {
         error,
         greptimedb_ingester::Error::Server { status, .. }
             if status.code() == tonic::Code::NotFound
+                && greptimedb_error_code(status) == Some("4001")
     )
+}
+
+fn greptimedb_error_code(status: &tonic::Status) -> Option<&str> {
+    status
+        .metadata()
+        .get("x-greptime-err-code")
+        .and_then(|value| value.to_str().ok())
 }
 
 struct Running {
@@ -1403,14 +1479,14 @@ async fn perform_statement(
         Request::Execute(sql) => {
             let mut stream = client.db.query(&sql).await.map_err(|error| {
                 client.invalidate_channels_on(&error);
-                Failure::native(error, ErrorStage::Query, WriteOutcome::NotSent)
+                Failure::native(error, ErrorStage::Query, WriteOutcome::Unknown)
             })?;
             let mut batches = Vec::new();
             while let Some(batch) = stream.next().await {
                 check()?;
                 batches.push(batch.map_err(|error| {
                     client.invalidate_channels_on(&error);
-                    Failure::native(error, ErrorStage::Query, WriteOutcome::NotSent)
+                    Failure::native(error, ErrorStage::Query, WriteOutcome::Unknown)
                 })?);
             }
             Ok(Value::Batches(batches))
@@ -1419,7 +1495,10 @@ async fn perform_statement(
             if input.is_empty() {
                 return Ok(Value::Count(0));
             }
-            let server = fetch_table_schema(&client, &table).await?;
+            let server = match describe_table(&client, &table).await? {
+                TableSchemaLookup::Found(schema) => Some(schema),
+                TableSchemaLookup::NotFound | TableSchemaLookup::UnsupportedColumnType(_) => None,
+            };
             check()?;
             let ts_column = client.ts_column.clone();
             let inline = match &server {
@@ -1481,12 +1560,14 @@ async fn perform_statement(
                     .await
                     .map_err(|error| {
                         client.invalidate_channels_on(&error);
-                        Failure::native(error, ErrorStage::Insert, WriteOutcome::Unknown)
+                        let write_outcome = write_outcome_for_sdk_error(&error);
+                        Failure::native(error, ErrorStage::Insert, write_outcome)
                     })?
             } else {
                 client.db.insert(request).await.map_err(|error| {
                     client.invalidate_channels_on(&error);
-                    Failure::native(error, ErrorStage::Insert, WriteOutcome::Unknown)
+                    let write_outcome = write_outcome_for_sdk_error(&error);
+                    Failure::native(error, ErrorStage::Insert, write_outcome)
                 })?
             };
             Ok(Value::Count(count))
@@ -1506,9 +1587,19 @@ async fn perform_stream(
     check()?;
     match request {
         Request::StreamStart(table) => {
-            let schema = fetch_table_schema(&client, &table).await?.ok_or_else(|| {
-                Failure::Native(NativeFailure::table_not_found(ErrorStage::StreamStart))
-            })?;
+            let schema = match describe_table(&client, &table).await? {
+                TableSchemaLookup::Found(schema) => schema,
+                TableSchemaLookup::NotFound => {
+                    return Err(Failure::Native(NativeFailure::table_not_found(
+                        ErrorStage::StreamStart,
+                    )))
+                }
+                TableSchemaLookup::UnsupportedColumnType(column_type) => {
+                    return Err(Failure::message(format!(
+                        "Unknown column type: {column_type}"
+                    )))
+                }
+            };
             check()?;
             let mut inserter = BulkInserter::new(client.client.clone(), client.db.dbname());
             if let Some(auth) = &client.auth {
@@ -1590,7 +1681,8 @@ async fn perform_stream(
             })?;
             let result = writer.write_rows_async(rows).await.map_err(|error| {
                 client.invalidate_channels_on(&error);
-                Failure::native(error, ErrorStage::StreamWrite, WriteOutcome::Unknown)
+                let write_outcome = write_outcome_for_sdk_error(&error);
+                Failure::native(error, ErrorStage::StreamWrite, write_outcome)
             });
             if result.is_ok()
                 && resource.submitted_batches.fetch_add(1, Ordering::Relaxed)
@@ -1664,6 +1756,75 @@ mod tests {
     }
 
     #[test]
+    fn h2_response_stream_disconnect_is_transport() {
+        let error = greptimedb_ingester::Error::from(tonic::Status::unknown(
+            "h2 protocol error: error reading a body from connection",
+        ));
+        let failure =
+            NativeFailure::from_greptimedb(error, ErrorStage::Query, WriteOutcome::Unknown);
+
+        assert_eq!(failure.kind, ErrorKind::Transport);
+        assert_eq!(failure.code, ErrorCode::Unknown);
+        assert_eq!(failure.stage, ErrorStage::Query);
+        assert_eq!(failure.write_outcome, WriteOutcome::Unknown);
+    }
+
+    #[test]
+    fn h2_and_connection_messages_are_transport_for_any_status_code() {
+        for (code, message) in [
+            (
+                tonic::Code::Internal,
+                "h2 protocol error: connection error received",
+            ),
+            (tonic::Code::Cancelled, "h2 protocol error: stream reset"),
+            (tonic::Code::Unknown, "connection error detected"),
+        ] {
+            let error = greptimedb_ingester::Error::from(tonic::Status::new(code, message));
+            let failure =
+                NativeFailure::from_greptimedb(error, ErrorStage::Query, WriteOutcome::Unknown);
+
+            assert_eq!(failure.kind, ErrorKind::Transport, "{code:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn malformed_put_result_metadata_is_protocol_after_write() {
+        let error = greptimedb_ingester::Error::SerdeJson {
+            error: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            location: snafu::Location::default(),
+        };
+
+        assert_eq!(error_kind(&error), ErrorKind::Protocol);
+        assert_eq!(write_outcome_for_sdk_error(&error), WriteOutcome::Unknown);
+    }
+
+    #[test]
+    fn describe_table_quotes_and_escapes_identifier() {
+        assert_eq!(
+            describe_table_sql("sensor-data"),
+            "DESCRIBE \"sensor-data\""
+        );
+        assert_eq!(
+            describe_table_sql("sensor\"data"),
+            "DESCRIBE \"sensor\"\"data\""
+        );
+    }
+
+    #[test]
+    fn cancelled_server_error_is_not_reported_as_internal() {
+        let error =
+            greptimedb_ingester::Error::from(tonic::Status::cancelled("operation was canceled"));
+        let failure =
+            NativeFailure::from_greptimedb(error, ErrorStage::Metadata, WriteOutcome::NotSent);
+
+        assert_eq!(failure.kind, ErrorKind::Cancelled);
+        assert_eq!(failure.source, ErrorSource::Server);
+        assert_eq!(failure.code, ErrorCode::Cancelled);
+        assert_eq!(failure.stage, ErrorStage::Metadata);
+        assert_eq!(failure.write_outcome, WriteOutcome::NotSent);
+    }
+
+    #[test]
     fn not_found_errors_remain_distinct_from_transport_errors() {
         let error = greptimedb_ingester::Error::from(tonic::Status::not_found("table not found"));
         let failure =
@@ -1673,6 +1834,32 @@ mod tests {
         assert_eq!(failure.code, ErrorCode::NotFound);
         assert_eq!(failure.stage, ErrorStage::Metadata);
         assert_eq!(failure.write_outcome, WriteOutcome::NotSent);
+    }
+
+    #[test]
+    fn only_table_not_found_server_code_triggers_missing_table_fallback() {
+        let table_not_found = greptimedb_ingester::Error::from(status_with_greptime_code(
+            tonic::Code::NotFound,
+            "4001",
+            "table not found",
+        ));
+        assert!(is_table_not_found_error(&table_not_found));
+
+        for server_code in ["4002", "4004", "4005"] {
+            let error = greptimedb_ingester::Error::from(status_with_greptime_code(
+                tonic::Code::NotFound,
+                server_code,
+                "resource not found",
+            ));
+            assert!(
+                !is_table_not_found_error(&error),
+                "unexpected missing-table fallback for {server_code}"
+            );
+        }
+
+        let missing_code =
+            greptimedb_ingester::Error::from(tonic::Status::not_found("table not found"));
+        assert!(!is_table_not_found_error(&missing_code));
     }
 
     #[test]
@@ -1757,5 +1944,18 @@ mod tests {
             assert!(catch_unwind(AssertUnwindSafe(|| client.close())).is_ok());
         }
         runtime::stop(&owner);
+    }
+
+    fn status_with_greptime_code(
+        code: tonic::Code,
+        server_code: &str,
+        message: &str,
+    ) -> tonic::Status {
+        let mut status = tonic::Status::new(code, message);
+        status.metadata_mut().insert(
+            "x-greptime-err-code",
+            tonic::metadata::MetadataValue::try_from(server_code).unwrap(),
+        );
+        status
     }
 }
